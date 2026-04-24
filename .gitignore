@@ -1,2 +1,8 @@
 node_modules
 .env
+.DS_Store
+data/*.json
+midstr-backend/data/*.json
+midstr-bot/data/*.json
+midstr-wallet
+midstr-faucet
