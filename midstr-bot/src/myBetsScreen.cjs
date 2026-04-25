@@ -296,12 +296,26 @@ function buildBetLine(bet) {
   const title = shortText(bet.cleanedBet, 80)
   const stake = formatStake(bet.stake ?? bet.stakeAmount, bet.tokenSymbol)
 
+  const resultExpected =
+    bet.resultExpectedBy ||
+    bet.resultExpectedByUtc ||
+    bet.resultExpectedByTime ||
+    null
+
+  let resultExpectedLine = ''
+
+  if (resultExpected) {
+    resultExpectedLine =
+      `\nResult Expected By: ${escapeHtml(String(resultExpected))}`
+  }
+
   return (
     `${emoji} <b>${escapeHtml(title)}</b>\n` +
     `Role: ${escapeHtml(bet.roleLabel)}\n` +
     `Status: <b>${escapeHtml(bet.statusDisplay || 'Unknown')}</b>\n` +
-    `Stake: ${escapeHtml(stake)}\n` +
-    `Bet ID: <code>${escapeHtml(bet.betId)}</code>`
+    `Stake: ${escapeHtml(stake)}` +
+    resultExpectedLine +
+    `\nBet ID: <code>${escapeHtml(bet.betId)}</code>`
   )
 }
 
