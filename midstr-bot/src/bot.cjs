@@ -487,7 +487,16 @@ function joinInviteSummary(invite, timezone) {
 
   lines.push(`*Status:* ${escapeMd(invite.statusLabel || 'Awaiting opponent')}`)
   lines.push('')
-  lines.push('You will be betting directly against this user\\.')
+  lines.push('*You are betting AGAINST this claim\\.*')
+  lines.push('')
+  lines.push(`Creator claims:`)
+  lines.push(`${escapeMd(invite.cleanedBetText || '—')}`)
+  lines.push('')
+  lines.push('Your position:')
+  lines.push(`This claim is NOT correct\\.`)
+  lines.push('')
+  lines.push('If the creator is right, you lose\\.')
+  lines.push('If the creator is wrong, you win\\.')
 
   return lines.join('\n')
 }
@@ -989,11 +998,15 @@ async function createDraftStep(chatId, userId, from) {
       draftSummary(getSession(userId).flow),
       '',
       `*Reference ID:* ${escapeMd(result.draft.draftId)}`,
-      `*Open signing page:* ${escapeMd(signingUrl)}`,
+          '',
+      'Your wager is ready\\.',
+      'Review your bet and confirm it in your wallet to place it on\\-chain\\.',
       '',
-      'The signing page checks approval automatically\\.',
+      'The wallet page checks approval automatically\\.',
       'If your allowance is already sufficient, no separate approval step will appear\\.',
       'No funds are locked unless the transaction succeeds\\.',
+      '',
+      `*Wallet link:* ${escapeMd(signingUrl)}`,
     ]
 
     await sendMd(chatId, lines.join('\n'))
@@ -1080,7 +1093,7 @@ async function showJoinInviteScreen(chatId, userId) {
     chatId,
     arbiterIntro(joinInviteSummary(invite, timezone)),
     inlineKeyboard([
-      [callbackButton('Join Bet', 'joinbet:review:join')],
+      [callbackButton('Bet Against', 'joinbet:review:join')],
       [callbackButton('Start', 'nav:start')],
     ])
   )
@@ -1159,7 +1172,7 @@ async function showJoinHandoffScreen(chatId, userId) {
     await sendMd(
       chatId,
       arbiterIntro(
-        `Accept this bet in your wallet\\.\n\n` +
+        `You are betting AGAINST this claim\\.\n\n` +
           `*Stake:* ${escapeMd(formatStakeValue(invite.stake))}\n` +
           `*Against:* ${escapeMd(inviteCreatorLabel(invite))}\n\n` +
           `The wallet page handles approval automatically if needed\\.\n` +
@@ -1182,12 +1195,12 @@ async function showJoinHandoffScreen(chatId, userId) {
       `Accept this bet in your wallet\\.\n\n` +
         `*Stake:* ${escapeMd(formatStakeValue(invite.stake))}\n` +
         `*Against:* ${escapeMd(inviteCreatorLabel(invite))}\n\n` +
-        `The wallet page checks approval automatically if needed\\.\n` +
+        `Review the wager and confirm your side in your wallet to place it on\\-chain\\.\n` +
         `If approval is already sufficient, no separate approval step appears\\.\n\n` +
         `No funds are locked unless the transaction succeeds\\.`
     ),
     inlineKeyboard([
-      [urlButton('Open Signing Page', signingUrl)],
+      [urlButton('Confirm Bet in Wallet', signingUrl)],
       [callbackButton('Cancel', 'joinbet:handoff:cancel')],
     ])
   )
@@ -1219,7 +1232,7 @@ async function showJoinStillPendingScreen(chatId, userId) {
       `Still waiting for confirmation\\.\n\nComplete the wallet signing step to join this bet\\.`
     ),
     inlineKeyboard([
-      [urlButton('Open Signing Page', session.join.signingUrl)],
+      [urlButton('Confirm Bet in Wallet', session.join.signingUrl)],
       [callbackButton('Check Status', 'joinbet:pending:check')],
       [callbackButton('Cancel', 'joinbet:pending:cancel')],
     ])
@@ -1275,7 +1288,7 @@ async function showJoinCancelledScreen(chatId, userId) {
       `Join cancelled\\.\n\nYou can accept this wager anytime before it closes\\.`
     ),
     inlineKeyboard([
-      [callbackButton('Join Bet', 'joinbet:review:join')],
+      [callbackButton('Bet Against', 'joinbet:review:join')],
       [callbackButton('Start', 'nav:start')],
     ])
   )
@@ -1320,7 +1333,7 @@ async function handleJoinStatusCheck(chatId, userId) {
           `This signing session has expired\\.\n\nPlease start again\\.`
         ),
         inlineKeyboard([
-          [callbackButton('Join Bet', 'joinbet:review:join')],
+          [callbackButton('Bet Against', 'joinbet:review:join')],
           [callbackButton('Start', 'nav:start')],
         ])
       )

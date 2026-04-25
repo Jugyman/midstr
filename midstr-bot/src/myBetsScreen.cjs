@@ -48,8 +48,9 @@ function displayStatus(status) {
   if (s === 'CLOSED') return 'Awaiting Result'
   if (s === 'WAITING_RESULT') return 'Awaiting Result'
   if (s === 'RESOLUTION_WINDOW') return 'Resolution Window'
+  if (s === 'RESOLUTION_WINDOW_OPEN') return 'Resolution Window'
   if (s === 'DISPUTED') return 'Disputed'
-  if (['RESOLVED', 'FINALISED', 'FINALIZED'].includes(s)) return 'Resolved'
+  if (['RESOLVED', 'SETTLED', 'FINALISED', 'FINALIZED'].includes(s)) return 'Resolved'
   if (s === 'CANCELLED') return 'Cancelled'
   if (s === 'EXPIRED') return 'Expired'
 
@@ -64,8 +65,9 @@ function statusEmoji(status) {
   if (s === 'CLOSED') return '⏳'
   if (s === 'WAITING_RESULT') return '⌛'
   if (s === 'RESOLUTION_WINDOW') return '⚖️'
+  if (s === 'RESOLUTION_WINDOW_OPEN') return '⚖️'
   if (s === 'DISPUTED') return '🚨'
-  if (['RESOLVED', 'FINALISED', 'FINALIZED'].includes(s)) return '✅'
+  if (['RESOLVED', 'SETTLED', 'FINALISED', 'FINALIZED'].includes(s)) return '✅'
   if (['CANCELLED', 'EXPIRED'].includes(s)) return '⚫'
 
   return '•'
@@ -77,12 +79,19 @@ function isOpenStatus(status) {
 
 function isActiveStatus(status) {
   const s = normalizeStatus(status)
-  return s === 'ACTIVE' || s === 'CLOSED' || s === 'WAITING_RESULT' || s === 'RESOLUTION_WINDOW' || s === 'DISPUTED'
+  return (
+    s === 'ACTIVE' ||
+    s === 'CLOSED' ||
+    s === 'WAITING_RESULT' ||
+    s === 'RESOLUTION_WINDOW' ||
+    s === 'RESOLUTION_WINDOW_OPEN' ||
+    s === 'DISPUTED'
+  )
 }
 
 function isResolvedStatus(status) {
   const s = normalizeStatus(status)
-  return ['RESOLVED', 'FINALISED', 'FINALIZED', 'CANCELLED', 'EXPIRED'].includes(s)
+  return ['RESOLVED', 'SETTLED', 'FINALISED', 'FINALIZED', 'CANCELLED', 'EXPIRED'].includes(s)
 }
 
 function isLegacyHiddenStatus(status) {
@@ -228,15 +237,58 @@ function classificationLabel(value) {
 function resolutionNoteForClassification(classification) {
   const raw = String(classification || '').trim().toUpperCase()
 
+  if (raw === 'VERIFIABLE') {
+    return 'AI proposes the result from public evidence. The proposed loser can concede or challenge with a bond.'
+  }
+
   if (raw === 'AMBIGUOUS') {
-    return 'This bet may need review at resolution. Challenge flow can apply if the outcome is disputed.'
+    return 'AI can suggest a likely winner, but either side may still dispute. A challenge requires a bond.'
   }
 
   if (raw === 'MANUAL_ONLY') {
-    return 'This bet is likely to need manual review at resolution. Challenge flow can apply if the outcome is disputed.'
+    return 'Only invite people you trust. Manual Only bets may fail to resolve fairly if someone refuses to concede.'
   }
 
   return ''
+}
+
+function formatDate(value) {
+  if (!value) return ''
+  const ms = Date.parse(value)
+  if (Number.isNaN(ms)) return String(value)
+  return new Date(ms).toLocaleString('en-GB', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  })
+}
+
+function sideLabel(side) {
+  const n = Number(side)
+  if (n === 1) return 'Creator'
+  if (n === 2) return 'Taker'
+  return 'None'
+}
+
+function maybeFormatTokenWei(value, tokenSymbol = 'MIDSTR') {
+  if (value === null || value === undefined || value === '') return ''
+  const raw = String(value)
+
+  if (!/^\d+$/.test(raw)) return `${raw} ${tokenSymbol}`
+
+  try {
+    const n = BigInt(raw)
+    const whole = n / 10n ** 18n
+    const fraction = n % 10n ** 18n
+
+    if (fraction === 0n) {
+      return `${whole.toString()} ${tokenSymbol}`
+    }
+
+    const frac = fraction.toString().padStart(18, '0').replace(/0+$/, '').slice(0, 4)
+    return `${whole.toString()}.${frac} ${tokenSymbol}`
+  } catch {
+    return `${raw} ${tokenSymbol}`
+  }
 }
 
 function buildBetLine(bet) {
@@ -320,6 +372,51 @@ function buildMyBetsKeyboard(visibleBets, currentFilter) {
   }
 }
 
+function buildResolutionKeyboard(betId, filter, resolution) {
+  const rows = []
+
+  const actions = resolution?.actions || {}
+
+  if (actions.claimWin?.visible && actions.claimWin?.url) {
+    rows.push([{ text: '🏆 Claim Win', url: actions.claimWin.url }])
+  }
+
+  if (actions.concede?.visible && actions.concede?.url) {
+    rows.push([{ text: '🤝 Concede', url: actions.concede.url }])
+  }
+
+  if (actions.challenge?.visible && actions.challenge?.url) {
+    rows.push([{ text: '🚨 Challenge', url: actions.challenge.url }])
+  }
+
+  if (actions.settle?.visible && actions.settle?.url) {
+    rows.push([{ text: '💰 Settle', url: actions.settle.url }])
+  }
+
+  if (actions.timeoutResolve?.visible && actions.timeoutResolve?.url) {
+    rows.push([{ text: '⏱ Timeout Resolve', url: actions.timeoutResolve.url }])
+  }
+
+  rows.push([
+    {
+      text: '🔎 Check Resolution Status',
+      callback_data: `mybets_open_${filter}__${betId}`,
+    },
+  ])
+
+  rows.push([
+    { text: '📜 Back to My Bets', callback_data: `mybets_filter_${filter}` },
+  ])
+
+  rows.push([
+    { text: '🏠 Back', callback_data: 'nav:start' },
+  ])
+
+  return {
+    inline_keyboard: rows,
+  }
+}
+
 async function fetchJson(url) {
   const response = await fetch(url)
 
@@ -339,6 +436,16 @@ async function loadMyBets(telegramUserId) {
   return {
     summary: summarise(bets),
     bets,
+  }
+}
+
+async function loadResolutionStatus(backendBaseUrl, betId, telegramUserId) {
+  try {
+    const url = `${backendBaseUrl}/resolution/status/${encodeURIComponent(betId)}?telegramUserId=${encodeURIComponent(telegramUserId)}`
+    return await fetchJson(url)
+  } catch (error) {
+    console.error('load resolution status failed:', error)
+    return null
   }
 }
 
@@ -381,54 +488,106 @@ async function handleMyBetsOpen(bot, query, backendBaseUrl = BACKEND_BASE_URL) {
     })
   }
 
-  const response = await fetchJson(`${backendBaseUrl}/bets/${betId}`)
+  const response = await fetchJson(`${backendBaseUrl}/bets/${betId}?telegramUserId=${query.from.id}`)
   const bet = normaliseBetShape(response.bet || response.data || response)
+  const resolution = await loadResolutionStatus(backendBaseUrl, betId, query.from.id)
 
   const role =
-    String(
-      bet.creatorTelegramUserId ??
-      bet.creatorTelegramId ??
-      bet.creatorUserId ??
-      bet.telegramUserId ??
-      ''
-    ) === String(query.from.id)
+    resolution?.role === 'CREATOR'
       ? 'Creator'
-      : bet.roleLabel || 'Taker'
+      : resolution?.role === 'TAKER'
+        ? 'Taker'
+        : String(
+            bet.creatorTelegramUserId ??
+            bet.creatorTelegramId ??
+            bet.creatorUserId ??
+            bet.telegramUserId ??
+            ''
+          ) === String(query.from.id)
+          ? 'Creator'
+          : bet.roleLabel || 'Taker'
+
+  const statusDisplay = resolution?.statusLabel || bet.statusDisplay || 'Unknown'
+  const classification = resolution?.classification || bet.classification
+  const resultExpectedBy = resolution?.resultExpectedBy || bet.resultExpectedBy || bet.resultExpectedByUtc
+  const suggestion = resolution?.suggestion || bet.resolutionSuggestion || null
 
   const lines = [
     `🎯 <b>Bet Details</b>`,
     ``,
-    `<b>${escapeHtml(bet.cleanedBet)}</b>`,
+    `<b>${escapeHtml(bet.cleanedBet || resolution?.cleanedBetText)}</b>`,
     ``,
     `Bet ID: <code>${escapeHtml(bet.betId || betId)}</code>`,
     `Role: ${escapeHtml(role)}`,
-    `Status: <b>${escapeHtml(bet.statusDisplay || 'Unknown')}</b>`,
-    `Stake: ${escapeHtml(formatStake(bet.stake ?? bet.stakeAmount, bet.tokenSymbol || 'MIDSTR'))}`,
+    `Status: <b>${escapeHtml(displayStatus(statusDisplay))}</b>`,
+    `Stake: ${escapeHtml(formatStake(bet.stake ?? bet.stakeAmount ?? resolution?.stake, bet.tokenSymbol || resolution?.tokenSymbol || 'MIDSTR'))}`,
   ]
 
-  if (bet.classification) {
-    lines.push(`Classification: ${escapeHtml(classificationLabel(bet.classification))}`)
+  if (bet.onChainBetId || resolution?.onChainBetId !== null) {
+    lines.push(`On-chain ID: <code>${escapeHtml(bet.onChainBetId ?? resolution?.onChainBetId ?? '')}</code>`)
+  }
+
+  if (classification) {
+    lines.push(`Classification: ${escapeHtml(classificationLabel(classification))}`)
   }
 
   if (bet.closeAt || bet.closeTimeUtc || bet.closeTime) {
-    lines.push(`Open until: ${escapeHtml(bet.closeAt || bet.closeTimeUtc || bet.closeTime)}`)
+    lines.push(`Open until: ${escapeHtml(formatDate(bet.closeAt || bet.closeTimeUtc || bet.closeTime))}`)
   }
 
-  if (bet.resultExpectedBy || bet.resultExpectedByUtc) {
-    lines.push(`Result expected by: ${escapeHtml(bet.resultExpectedBy || bet.resultExpectedByUtc)}`)
+  if (resultExpectedBy) {
+    lines.push(`Result expected by: ${escapeHtml(formatDate(resultExpectedBy))}`)
   }
 
-  const resolutionNote = resolutionNoteForClassification(bet.classification)
+  if (resolution?.window?.windowEnd) {
+    lines.push(`Resolution window ends: ${escapeHtml(formatDate(resolution.window.windowEnd))}`)
+  }
+
+  const resolutionNote = resolutionNoteForClassification(classification)
   if (resolutionNote) {
-    lines.push(`Resolution note: ${escapeHtml(resolutionNote)}`)
+    lines.push(``)
+    lines.push(`ℹ️ ${escapeHtml(resolutionNote)}`)
   }
 
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: '📜 Back to My Bets', callback_data: `mybets_filter_${filter}` }],
-      [{ text: '🏠 Back', callback_data: 'nav:start' }],
-    ],
+  if (resolution?.warning && resolution.warning !== resolutionNote) {
+    lines.push(`⚠️ ${escapeHtml(resolution.warning)}`)
   }
+
+  if (suggestion?.text) {
+    lines.push(``)
+    lines.push(`🧠 <b>Arbiter suggestion</b>`)
+    lines.push(`${escapeHtml(suggestion.text)}`)
+
+    if (suggestion.evidenceSummary) {
+      lines.push(`Evidence: ${escapeHtml(shortText(suggestion.evidenceSummary, 180))}`)
+    }
+
+    if (suggestion.confidence) {
+      lines.push(`Confidence: ${escapeHtml(suggestion.confidence)}`)
+    }
+  } else if (normalizeStatus(resolution?.status || bet.status) === 'WAITING_RESULT') {
+    lines.push(``)
+    lines.push(`🧠 The Arbiter has not proposed a result yet.`)
+  }
+
+  if (resolution?.proposedWinnerSide) {
+    lines.push(`Proposed winner: <b>${escapeHtml(sideLabel(resolution.proposedWinnerSide))}</b>`)
+  }
+
+  if (resolution?.chain?.finalWinnerSide) {
+    lines.push(`Final winner: <b>${escapeHtml(sideLabel(resolution.chain.finalWinnerSide))}</b>`)
+  }
+
+  const challengeBond = resolution?.challengeBondAmount
+  if (challengeBond) {
+    lines.push(`Challenge bond: ${escapeHtml(maybeFormatTokenWei(challengeBond, resolution.bondToken || 'MIDSTR'))}`)
+  }
+
+  if (resolution?.chain?.statusName) {
+    lines.push(`Chain status: <code>${escapeHtml(resolution.chain.statusName)}</code>`)
+  }
+
+  const keyboard = buildResolutionKeyboard(bet.betId || betId, filter, resolution)
 
   return bot.sendMessage(chatId, lines.join('\n'), {
     parse_mode: 'HTML',
