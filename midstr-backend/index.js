@@ -24,6 +24,33 @@ const DATA_DIR = path.join(__dirname, "data");
 const DRAFTS_FILE = path.join(DATA_DIR, "drafts.json");
 const JOINS_FILE = path.join(DATA_DIR, "joinSessions.json");
 
+const RESOLUTION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+const RESOLUTION_TYPES = {
+  VERIFIABLE: 0,
+  AMBIGUOUS: 1,
+  MANUAL_ONLY: 2,
+};
+
+const CHAIN_STATUS = {
+  0: "NONE",
+  1: "CREATED",
+  2: "LIVE",
+  3: "CLOSED",
+  4: "WAITING_RESULT",
+  5: "RESOLUTION_WINDOW_OPEN",
+  6: "DISPUTED",
+  7: "FINALISED",
+  8: "SETTLED",
+  9: "CANCELLED",
+};
+
+const SIDE_LABELS = {
+  0: "None",
+  1: "Creator",
+  2: "Taker",
+};
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -59,6 +86,18 @@ function isValidIso(iso) {
 function parseIso(iso) {
   const ms = Date.parse(iso);
   return Number.isNaN(ms) ? null : ms;
+}
+
+function isoFromUnixSeconds(value) {
+  const n = Number(value || 0);
+  if (!n) return null;
+  return new Date(n * 1000).toISOString();
+}
+
+function unixSecondsFromIso(iso) {
+  const ms = parseIso(iso);
+  if (!ms) return 0;
+  return Math.floor(ms / 1000);
 }
 
 function looksClearlyVerifiable(text) {
@@ -103,6 +142,12 @@ function normalizeTokenAmount(value, fallback = "0") {
   return String(n);
 }
 
+function challengeBondForStake(stake) {
+  const n = Number(stake || 0);
+  if (Number.isNaN(n) || n <= 0) return "0";
+  return String(n * 0.5);
+}
+
 function deriveBetIdFromDraftId(draftId) {
   const suffix = String(draftId || "").replace(/^DRAFT[-_]?/i, "");
   return `BET-${suffix}`;
@@ -125,15 +170,56 @@ function deriveDraftIdCandidates(inputId) {
   return [...new Set(candidates)];
 }
 
+function normaliseClassification(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function manualOnlyWarning(classification) {
+  const c = normaliseClassification(classification);
+
+  if (c !== "MANUAL_ONLY") return "";
+
+  return [
+    "Manual Only warning:",
+    "Only invite people you trust.",
+    "Manual Only bets may fail to resolve fairly.",
+    "Dishonest users may refuse to concede.",
+  ].join(" ");
+}
+
+function resolutionWarningForClassification(classification) {
+  const c = normaliseClassification(classification);
+
+  if (c === "MANUAL_ONLY") {
+    return manualOnlyWarning(c);
+  }
+
+  if (c === "AMBIGUOUS") {
+    return "Ambiguous bet warning: AI can suggest an outcome, but the loser may challenge by posting a bond.";
+  }
+
+  return "Verifiable bet: AI proposes the result from public evidence. The loser can concede or challenge by posting a bond.";
+}
+
 function ensureDraftDefaults(draft) {
   if (!draft || typeof draft !== "object") return draft;
 
-  const classification = String(draft.classification || "").toUpperCase();
-  const requiresBondDefault =
-    classification === "AMBIGUOUS" || classification === "MANUAL_ONLY";
-
+  const classification = normaliseClassification(draft.classification);
   const stake = normalizeStake(draft.stake) || "0";
-  const bondAmount = normalizeTokenAmount(draft.bondAmount, "0");
+
+  const defaultChallengeBond = challengeBondForStake(stake);
+  const existingBondAmount = normalizeTokenAmount(draft.bondAmount, "0");
+
+  const shouldHaveChallengeBond =
+    classification === "VERIFIABLE" ||
+    classification === "AMBIGUOUS" ||
+    classification === "MANUAL_ONLY";
+
+  const fixedBondAmount =
+    shouldHaveChallengeBond && Number(existingBondAmount) <= 0
+      ? defaultChallengeBond
+      : existingBondAmount;
+
   const totalCreatorUpfront = normalizeTokenAmount(
     draft.totalCreatorUpfront,
     stake
@@ -159,15 +245,18 @@ function ensureDraftDefaults(draft) {
       draft.onChainBetId === null || draft.onChainBetId === undefined
         ? null
         : Number(draft.onChainBetId),
-    requiresBond:
-      typeof draft.requiresBond === "boolean"
-        ? draft.requiresBond
-        : requiresBondDefault,
-    bondAmount,
+    requiresBond: shouldHaveChallengeBond,
+    bondAmount: fixedBondAmount,
     bondToken: draft.bondToken || "MIDSTR",
-    bondMode: draft.bondMode || "NONE",
+    bondMode: draft.bondMode || "CHALLENGE_ONLY",
     totalCreatorUpfront,
     totalTakerUpfront,
+    resultExpectedBy: draft.resultExpectedBy || null,
+    resolutionSuggestion: draft.resolutionSuggestion || null,
+    resolutionSuggestionAt: draft.resolutionSuggestionAt || "",
+    resolutionProposedTxHash: draft.resolutionProposedTxHash || "",
+    disputeFinaliseTxHash: draft.disputeFinaliseTxHash || "",
+    resolutionUpdatedAt: draft.resolutionUpdatedAt || "",
   };
 }
 
@@ -188,56 +277,88 @@ function hasConfirmedJoinSession(joinStore, draft) {
   );
 }
 
+function getResolutionWindowInfo(draft) {
+  const resultExpectedByMs = parseIso(draft?.resultExpectedBy || "");
+  if (!resultExpectedByMs) {
+    return {
+      hasResultExpectedBy: false,
+      resultExpectedBy: null,
+      windowStart: null,
+      windowEnd: null,
+      windowOpen: false,
+      windowExpired: false,
+    };
+  }
+
+  const windowEndMs = resultExpectedByMs + RESOLUTION_WINDOW_MS;
+  const now = Date.now();
+
+  return {
+    hasResultExpectedBy: true,
+    resultExpectedBy: new Date(resultExpectedByMs).toISOString(),
+    windowStart: new Date(resultExpectedByMs).toISOString(),
+    windowEnd: new Date(windowEndMs).toISOString(),
+    windowOpen: now >= resultExpectedByMs && now < windowEndMs,
+    windowExpired: now >= windowEndMs,
+  };
+}
+
 function deriveEffectiveBetStatus(draft, joinStore) {
   const safeDraft = ensureDraftDefaults(draft);
   const rawStatus = String(safeDraft.status || "").toUpperCase();
-
-  if (
+  const joined =
     safeDraft.takerWallet ||
     safeDraft.takerFundingTxHash ||
     String(safeDraft.takerFundingStatus || "").toUpperCase() === "FUNDED" ||
-    hasConfirmedJoinSession(joinStore, safeDraft)
-  ) {
-    return "ACTIVE";
+    hasConfirmedJoinSession(joinStore, safeDraft);
+
+  if (["SETTLED", "RESOLVED", "FINALISED", "FINALIZED"].includes(rawStatus)) {
+    return "RESOLVED";
   }
 
-  if (["RESOLVED", "FINALISED", "FINALIZED"].includes(rawStatus)) {
-    return "RESOLVED";
+  if (rawStatus === "DISPUTED") {
+    return "DISPUTED";
   }
 
   if (["CANCELLED", "EXPIRED"].includes(rawStatus)) {
     return rawStatus;
   }
 
-  if (rawStatus === "ACTIVE") {
-    return "ACTIVE";
+  if (!joined) {
+    if (rawStatus === "CREATED" || rawStatus === "AWAITING_TAKER") {
+      return "CREATED";
+    }
+    return rawStatus || "CREATED";
   }
 
-  if (rawStatus === "CREATED" || rawStatus === "AWAITING_TAKER") {
-    return "CREATED";
+  const windowInfo = getResolutionWindowInfo(safeDraft);
+
+  if (windowInfo.windowOpen || windowInfo.windowExpired) {
+    if (safeDraft.resolutionSuggestion || safeDraft.resolutionProposedTxHash) {
+      return "RESOLUTION_WINDOW";
+    }
+
+    return "WAITING_RESULT";
   }
 
-  return rawStatus || "CREATED";
+  if (isValidIso(safeDraft.closeTime) && parseIso(safeDraft.closeTime) <= Date.now()) {
+    return "CLOSED";
+  }
+
+  return "ACTIVE";
 }
 
 function getJoinableStatusLabel(draft, joinStore) {
   const effectiveStatus = deriveEffectiveBetStatus(draft, joinStore);
 
-  if (effectiveStatus === "ACTIVE") {
-    return "Active";
-  }
-
-  if (effectiveStatus === "RESOLVED") {
-    return "Resolved";
-  }
-
-  if (effectiveStatus === "CANCELLED") {
-    return "Cancelled";
-  }
-
-  if (effectiveStatus === "EXPIRED") {
-    return "Expired";
-  }
+  if (effectiveStatus === "ACTIVE") return "Active";
+  if (effectiveStatus === "CLOSED") return "Awaiting Result";
+  if (effectiveStatus === "WAITING_RESULT") return "Awaiting Result";
+  if (effectiveStatus === "RESOLUTION_WINDOW") return "Resolution Window";
+  if (effectiveStatus === "DISPUTED") return "Disputed";
+  if (effectiveStatus === "RESOLVED") return "Resolved";
+  if (effectiveStatus === "CANCELLED") return "Cancelled";
+  if (effectiveStatus === "EXPIRED") return "Expired";
 
   return "Awaiting opponent";
 }
@@ -349,6 +470,63 @@ function findDraftByBetId(store, betId) {
   });
 }
 
+function getUserRoleForDraft(draft, telegramUserId) {
+  const userId = String(telegramUserId || "");
+
+  if (!userId) return "UNKNOWN";
+  if (String(draft.telegramUserId || "") === userId) return "CREATOR";
+  if (String(draft.takerTelegramUserId || "") === userId) return "TAKER";
+
+  return "UNKNOWN";
+}
+
+function sideForRole(role) {
+  if (role === "CREATOR") return 1;
+  if (role === "TAKER") return 2;
+  return 0;
+}
+
+function oppositeSide(side) {
+  if (side === 1) return 2;
+  if (side === 2) return 1;
+  return 0;
+}
+
+function parseChainBet(raw) {
+  if (!raw) return null;
+
+  return {
+    creatorWallet: raw.creatorWallet,
+    takerWallet: raw.takerWallet,
+    stake: raw.stake?.toString?.() || "0",
+    resolutionType: Number(raw.resolutionType),
+    status: Number(raw.status),
+    statusName: CHAIN_STATUS[Number(raw.status)] || "UNKNOWN",
+    closeTimeUtc: Number(raw.closeTimeUtc),
+    closeTimeIso: isoFromUnixSeconds(raw.closeTimeUtc),
+    resultExpectedByUtc: Number(raw.resultExpectedByUtc),
+    resultExpectedByIso: isoFromUnixSeconds(raw.resultExpectedByUtc),
+    proposalTimeUtc: Number(raw.proposalTimeUtc),
+    proposalTimeIso: isoFromUnixSeconds(raw.proposalTimeUtc),
+    finalisedAtUtc: Number(raw.finalisedAtUtc),
+    finalisedAtIso: isoFromUnixSeconds(raw.finalisedAtUtc),
+    proposedWinnerSide: Number(raw.proposedWinnerSide),
+    proposedWinnerLabel: SIDE_LABELS[Number(raw.proposedWinnerSide)] || "Unknown",
+    finalWinnerSide: Number(raw.finalWinnerSide),
+    finalWinnerLabel: SIDE_LABELS[Number(raw.finalWinnerSide)] || "Unknown",
+    challengerWallet: raw.challengerWallet,
+    challengeBond: raw.challengeBond?.toString?.() || "0",
+    challengeCorrect: Boolean(raw.challengeCorrect),
+    creatorFunded: Boolean(raw.creatorFunded),
+    takerFunded: Boolean(raw.takerFunded),
+    settled: Boolean(raw.settled),
+  };
+}
+
+function actionUrl(betId, action) {
+  return `${WEB_BASE_URL}/resolve/${encodeURIComponent(betId)}?action=${encodeURIComponent(action)}`;
+}
+
 async function classifyBetWithAI(betText) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY is missing in midstr-backend");
@@ -370,7 +548,8 @@ async function classifyBetWithAI(betText) {
           "- MANUAL_ONLY = subjective, taste-based, opinion-based, or inherently not externally resolvable.",
           "",
           "Important locked MIDSTR rule:",
-          "- AMBIGUOUS and MANUAL_ONLY require Result Expected By downstream.",
+          "- Result Expected By is required for all classifications.",
+          "- Result Expected By starts the global 7-day resolution response window.",
           "",
           "Very important:",
           "- BTC/crypto price target bets are usually VERIFIABLE.",
@@ -431,7 +610,7 @@ async function classifyBetWithAI(betText) {
   const msg = response.choices?.[0]?.message;
   const parsed = JSON.parse(msg?.content || "{}");
 
-  parsed.requiresResultExpectedBy = parsed.classification !== "VERIFIABLE";
+  parsed.requiresResultExpectedBy = true;
   parsed.missingFields = Array.isArray(parsed.missingFields)
     ? parsed.missingFields
     : [];
@@ -441,25 +620,274 @@ async function classifyBetWithAI(betText) {
     parsed.classification !== "VERIFIABLE"
   ) {
     parsed.classification = "VERIFIABLE";
-    parsed.requiresResultExpectedBy = false;
     parsed.explanation =
       "This wager appears objective and externally checkable from public data or official results.";
     parsed.settlementBasis =
       "Resolve using public market data or official competition/result data.";
     parsed.decisionType = "EVENT_BASED";
-    parsed.missingFields = parsed.missingFields.filter(
-      (f) => f !== "resultExpectedBy"
-    );
   }
 
-  if (
-    parsed.requiresResultExpectedBy &&
-    !parsed.missingFields.includes("resultExpectedBy")
-  ) {
+  if (!parsed.missingFields.includes("resultExpectedBy")) {
     parsed.missingFields.unshift("resultExpectedBy");
   }
 
   return parsed;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              CONTRACT HELPERS                              */
+/* -------------------------------------------------------------------------- */
+
+const ESCROW_V3_ABI = [
+  "function proposeResultVerifiable(uint256 betId, uint8 winnerSide) external",
+  "function finaliseDispute(uint256 betId, uint8 finalWinnerSide, bool challengeCorrect) external",
+  "function refreshStatus(uint256 betId) external",
+  "function arbiterResolver() view returns (address)",
+  "function challengeBondAmount(uint256 betId) view returns (uint256)",
+  "function callerRewardAmount(uint256 betId) view returns (uint256)",
+  "function potAmount(uint256 betId) view returns (uint256)",
+  "function canClaimWin(uint256 betId, address user) view returns (bool)",
+  "function canConcede(uint256 betId, address user) view returns (bool)",
+  "function canChallenge(uint256 betId, address user) view returns (bool)",
+  "function canSettle(uint256 betId) view returns (bool)",
+  "function canTimeoutResolve(uint256 betId) view returns (bool)",
+  "function getWindowStart(uint256 betId) view returns (uint256)",
+  "function bets(uint256) view returns (address creatorWallet,address takerWallet,uint256 stake,uint8 resolutionType,uint8 status,uint64 closeTimeUtc,uint64 resultExpectedByUtc,uint64 proposalTimeUtc,uint64 finalisedAtUtc,uint8 proposedWinnerSide,uint8 finalWinnerSide,address challengerWallet,uint256 challengeBond,bool challengeCorrect,bool creatorFunded,bool takerFunded,bool settled)",
+];
+
+function getProvider() {
+  if (!process.env.SEPOLIA_RPC_URL) {
+    throw new Error("SEPOLIA_RPC_URL missing");
+  }
+
+  return new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+}
+
+function getReadContract() {
+  if (!process.env.ESCROW_TOKEN_ADDRESS) {
+    throw new Error("ESCROW_TOKEN_ADDRESS missing");
+  }
+
+  return new ethers.Contract(
+    process.env.ESCROW_TOKEN_ADDRESS,
+    ESCROW_V3_ABI,
+    getProvider()
+  );
+}
+
+function getResolverContract() {
+  if (!process.env.ARBITER_RESOLVER_PRIVATE_KEY) {
+    throw new Error("ARBITER_RESOLVER_PRIVATE_KEY missing");
+  }
+
+  if (!process.env.ESCROW_TOKEN_ADDRESS) {
+    throw new Error("ESCROW_TOKEN_ADDRESS missing");
+  }
+
+  const wallet = new ethers.Wallet(
+    process.env.ARBITER_RESOLVER_PRIVATE_KEY,
+    getProvider()
+  );
+
+  return new ethers.Contract(
+    process.env.ESCROW_TOKEN_ADDRESS,
+    ESCROW_V3_ABI,
+    wallet
+  );
+}
+
+async function assertResolverSigner(contract) {
+  const resolverAddress = await contract.arbiterResolver();
+  const signerAddress = await contract.runner.getAddress();
+
+  if (resolverAddress.toLowerCase() !== signerAddress.toLowerCase()) {
+    const error = new Error("Backend signer is not the contract arbiterResolver");
+    error.statusCode = 403;
+    error.details = { resolverAddress, signerAddress };
+    throw error;
+  }
+
+  return { resolverAddress, signerAddress };
+}
+
+async function readChainResolutionState(onChainBetId, userWallet = "") {
+  if (onChainBetId === null || onChainBetId === undefined || onChainBetId === "") {
+    return null;
+  }
+
+  const contract = getReadContract();
+  const id = BigInt(onChainBetId);
+
+  const [
+    rawBet,
+    challengeBondAmount,
+    callerRewardAmount,
+    potAmount,
+    windowStart,
+    canSettle,
+    canTimeoutResolve,
+  ] = await Promise.all([
+    contract.bets(id),
+    contract.challengeBondAmount(id).catch(() => 0n),
+    contract.callerRewardAmount(id).catch(() => 0n),
+    contract.potAmount(id).catch(() => 0n),
+    contract.getWindowStart(id).catch(() => 0n),
+    contract.canSettle(id).catch(() => false),
+    contract.canTimeoutResolve(id).catch(() => false),
+  ]);
+
+  const chainBet = parseChainBet(rawBet);
+
+  let userActions = {
+    canClaimWin: false,
+    canConcede: false,
+    canChallenge: false,
+  };
+
+  if (userWallet && ethers.isAddress(userWallet)) {
+    const [canClaimWin, canConcede, canChallenge] = await Promise.all([
+      contract.canClaimWin(id, userWallet).catch(() => false),
+      contract.canConcede(id, userWallet).catch(() => false),
+      contract.canChallenge(id, userWallet).catch(() => false),
+    ]);
+
+    userActions = {
+      canClaimWin: Boolean(canClaimWin),
+      canConcede: Boolean(canConcede),
+      canChallenge: Boolean(canChallenge),
+    };
+  }
+
+  return {
+    ...chainBet,
+    contractAddress: process.env.ESCROW_TOKEN_ADDRESS,
+    challengeBondAmount: challengeBondAmount.toString(),
+    callerRewardAmount: callerRewardAmount.toString(),
+    potAmount: potAmount.toString(),
+    windowStartUtc: Number(windowStart),
+    windowStartIso: isoFromUnixSeconds(windowStart),
+    canSettle: Boolean(canSettle),
+    canTimeoutResolve: Boolean(canTimeoutResolve),
+    userActions,
+  };
+}
+
+async function syncDraftFromChain(draft, chainState) {
+  if (!draft || !chainState) return draft;
+
+  const chainStatus = chainState.statusName;
+  const now = nowIso();
+
+  if (chainStatus === "DISPUTED") {
+    draft.status = "DISPUTED";
+  } else if (chainStatus === "FINALISED") {
+    draft.status = "FINALISED";
+  } else if (chainStatus === "SETTLED") {
+    draft.status = "RESOLVED";
+  } else if (chainStatus === "RESOLUTION_WINDOW_OPEN") {
+    draft.status = "RESOLUTION_WINDOW";
+  } else if (chainStatus === "WAITING_RESULT") {
+    draft.status = "WAITING_RESULT";
+  } else if (chainStatus === "CLOSED") {
+    draft.status = "CLOSED";
+  }
+
+  draft.chainStatus = chainStatus;
+  draft.chainProposedWinnerSide = chainState.proposedWinnerSide;
+  draft.chainFinalWinnerSide = chainState.finalWinnerSide;
+  draft.chainChallengeBond = chainState.challengeBond;
+  draft.chainChallengeCorrect = chainState.challengeCorrect;
+  draft.chainSettled = chainState.settled;
+  draft.resolutionUpdatedAt = now;
+  draft.updatedAt = now;
+
+  return draft;
+}
+
+async function buildResolutionStatusPayload(draft, telegramUserId = "") {
+  const joinStore = await readJoinStore();
+  const effectiveStatus = deriveEffectiveBetStatus(draft, joinStore);
+  const role = getUserRoleForDraft(draft, telegramUserId);
+  const userWallet = role === "CREATOR" ? draft.creatorWallet : role === "TAKER" ? draft.takerWallet : "";
+  const chainState = await readChainResolutionState(draft.onChainBetId, userWallet).catch((err) => {
+    console.warn("[resolution-status] chain read failed:", err.message);
+    return null;
+  });
+
+  const windowInfo = getResolutionWindowInfo(draft);
+  const userSide = sideForRole(role);
+  const proposedWinnerSide =
+    chainState?.proposedWinnerSide ||
+    Number(draft.resolutionSuggestion?.winnerSide || 0);
+
+  const proposedLoserSide = proposedWinnerSide ? oppositeSide(proposedWinnerSide) : 0;
+
+  const actions = {
+    claimWin: {
+      visible:
+        role !== "UNKNOWN" &&
+        draft.classification !== "VERIFIABLE" &&
+        !proposedWinnerSide &&
+        (chainState?.userActions?.canClaimWin || windowInfo.windowOpen),
+      url: actionUrl(draft.betId, "claim"),
+    },
+    concede: {
+      visible:
+        role !== "UNKNOWN" &&
+        proposedWinnerSide > 0 &&
+        userSide === proposedLoserSide &&
+        (chainState?.userActions?.canConcede || windowInfo.windowOpen),
+      url: actionUrl(draft.betId, "concede"),
+    },
+    challenge: {
+      visible:
+        role !== "UNKNOWN" &&
+        proposedWinnerSide > 0 &&
+        userSide === proposedLoserSide &&
+        (chainState?.userActions?.canChallenge || windowInfo.windowOpen),
+      url: actionUrl(draft.betId, "challenge"),
+    },
+    settle: {
+      visible: Boolean(chainState?.canSettle),
+      url: actionUrl(draft.betId, "settle"),
+    },
+    timeoutResolve: {
+      visible: Boolean(chainState?.canTimeoutResolve || (windowInfo.windowExpired && !proposedWinnerSide)),
+      url: actionUrl(draft.betId, "timeout"),
+    },
+    checkStatus: {
+      visible: true,
+    },
+  };
+
+  return {
+    ok: true,
+    betId: draft.betId,
+    draftId: draft.draftId,
+    onChainBetId: draft.onChainBetId ?? null,
+    role,
+    userWallet,
+    status: effectiveStatus,
+    statusLabel: getJoinableStatusLabel(draft, joinStore),
+    classification: draft.classification,
+    warning: resolutionWarningForClassification(draft.classification),
+    manualOnlyWarning: manualOnlyWarning(draft.classification),
+    cleanedBetText: draft.cleanedBetText,
+    stake: draft.stake,
+    tokenSymbol: "MIDSTR",
+    resultExpectedBy: draft.resultExpectedBy,
+    window: windowInfo,
+    suggestion: draft.resolutionSuggestion || null,
+    suggestionAt: draft.resolutionSuggestionAt || "",
+    proposedWinnerSide,
+    proposedWinnerLabel: SIDE_LABELS[proposedWinnerSide] || "None",
+    challengeBondAmount:
+      chainState?.challengeBondAmount ||
+      ethers.parseUnits(challengeBondForStake(draft.stake), 18).toString(),
+    bondToken: "MIDSTR",
+    chain: chainState,
+    actions,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -472,6 +900,7 @@ app.get("/health", async (_req, res) => {
     service: "midstr-backend",
     port: PORT,
     webBaseUrl: WEB_BASE_URL,
+    escrowTokenAddress: process.env.ESCROW_TOKEN_ADDRESS || "",
   });
 });
 
@@ -549,14 +978,18 @@ app.post("/drafts", async (req, res) => {
       });
     }
 
-    if (
-      classification !== "VERIFIABLE" &&
-      (!resultExpectedBy || !isValidIso(resultExpectedBy))
-    ) {
+    if (!resultExpectedBy || !isValidIso(resultExpectedBy)) {
       return res.status(400).json({
         ok: false,
         error:
-          "resultExpectedBy is required for AMBIGUOUS and MANUAL_ONLY drafts",
+          "resultExpectedBy is required for all bet types because it starts the 7-day resolution clock",
+      });
+    }
+
+    if (parseIso(resultExpectedBy) <= parseIso(closeTime)) {
+      return res.status(400).json({
+        ok: false,
+        error: "resultExpectedBy must be after closeTime",
       });
     }
 
@@ -568,15 +1001,21 @@ app.post("/drafts", async (req, res) => {
       });
     }
 
-    const upperClassification = String(classification || "").toUpperCase();
-    const computedRequiresBond =
-      typeof requiresBond === "boolean"
-        ? requiresBond
-        : upperClassification === "AMBIGUOUS" ||
-          upperClassification === "MANUAL_ONLY";
+    const upperClassification = normaliseClassification(classification);
 
-    const normalizedBondAmount = normalizeTokenAmount(bondAmount, "0");
-    const normalizedBondMode = bondMode || "NONE";
+    if (!Object.prototype.hasOwnProperty.call(RESOLUTION_TYPES, upperClassification)) {
+      return res.status(400).json({
+        ok: false,
+        error: "classification must be VERIFIABLE, AMBIGUOUS, or MANUAL_ONLY",
+      });
+    }
+
+    const normalizedBondAmount =
+      Number(normalizeTokenAmount(bondAmount, "0")) > 0
+        ? normalizeTokenAmount(bondAmount, "0")
+        : challengeBondForStake(normalizedStake);
+
+    const normalizedBondMode = bondMode || "CHALLENGE_ONLY";
     const normalizedBondToken = bondToken || "MIDSTR";
 
     const store = await readDraftStore();
@@ -602,8 +1041,7 @@ app.post("/drafts", async (req, res) => {
       decisionType: decisionType || "EVENT_BASED",
       stake: normalizedStake,
       closeTime,
-      resultExpectedBy:
-        upperClassification === "VERIFIABLE" ? null : resultExpectedBy,
+      resultExpectedBy,
       earliestCheckTimeHint: earliestCheckTimeHint || "",
       latestDecisionTimeHint: latestDecisionTimeHint || "",
       creatorFundingStatus: "PENDING",
@@ -615,7 +1053,7 @@ app.post("/drafts", async (req, res) => {
       takerWallet: "",
       takerFundingStatus: "",
       takerFundingTxHash: "",
-      requiresBond: computedRequiresBond,
+      requiresBond: true,
       bondAmount: normalizedBondAmount,
       bondToken: normalizedBondToken,
       bondMode: normalizedBondMode,
@@ -627,6 +1065,7 @@ app.post("/drafts", async (req, res) => {
         totalTakerUpfront,
         normalizedStake
       ),
+      resolutionWarning: resolutionWarningForClassification(upperClassification),
     });
 
     store.drafts.unshift(draft);
@@ -637,6 +1076,7 @@ app.post("/drafts", async (req, res) => {
       draft,
       signingUrl: `${WEB_BASE_URL}/sign?draftId=${draftId}`,
       inviteBetId: betId,
+      warning: resolutionWarningForClassification(upperClassification),
     });
   } catch (error) {
     console.error("draft creation failed:", error);
@@ -664,6 +1104,7 @@ app.get("/drafts/:draftId", async (req, res) => {
       ok: true,
       draft,
       signingUrl: `${WEB_BASE_URL}/sign?draftId=${draft.draftId}`,
+      warning: resolutionWarningForClassification(draft.classification),
     });
   } catch (error) {
     console.error("draft lookup failed:", error);
@@ -725,11 +1166,12 @@ app.get("/bets/:betId", async (req, res) => {
         creatorFundingStatus: draft.creatorFundingStatus || "",
         takerFundingStatus: draft.takerFundingStatus || "",
         requiresBond: Boolean(draft.requiresBond),
-        bondAmount: draft.bondAmount || "0",
+        bondAmount: draft.bondAmount || challengeBondForStake(draft.stake),
         bondToken: draft.bondToken || "MIDSTR",
-        bondMode: draft.bondMode || "NONE",
+        bondMode: draft.bondMode || "CHALLENGE_ONLY",
         totalCreatorUpfront: draft.totalCreatorUpfront || draft.stake || "0",
         totalTakerUpfront: draft.totalTakerUpfront || draft.stake || "0",
+        warning: resolutionWarningForClassification(draft.classification),
       },
     });
   } catch (error) {
@@ -846,6 +1288,7 @@ app.post("/bets/:betId/create-join-session", async (req, res) => {
         joinSessionId: sameUserPending.joinSessionId,
         signingUrl: sameUserPending.signingUrl,
         reused: true,
+        warning: resolutionWarningForClassification(draft.classification),
       });
     }
 
@@ -902,7 +1345,7 @@ app.post("/bets/:betId/create-join-session", async (req, res) => {
       telegramUsername: normalizeUsername(telegramUsername),
       telegramFirstName: telegramFirstName || "",
       expectedStake: draft.stake,
-      expectedBondAmount: draft.bondAmount || "0",
+      expectedBondAmount: draft.bondAmount || challengeBondForStake(draft.stake),
       expectedTotalUpfront: draft.totalTakerUpfront || draft.stake,
       onChainBetId: draft.onChainBetId ?? null,
       creatorWallet: draft.creatorWallet || "",
@@ -924,6 +1367,7 @@ app.post("/bets/:betId/create-join-session", async (req, res) => {
       joinSessionId,
       signingUrl: joinSession.signingUrl,
       reused: false,
+      warning: resolutionWarningForClassification(draft.classification),
     });
   } catch (error) {
     console.error("create join session failed:", error);
@@ -986,7 +1430,7 @@ app.get("/join-sessions/:joinSessionId", async (req, res) => {
       expectedBondAmount:
         joinSession.expectedBondAmount ||
         draft?.bondAmount ||
-        "0",
+        challengeBondForStake(draft?.stake),
       expectedTotalUpfront:
         joinSession.expectedTotalUpfront ||
         draft?.totalTakerUpfront ||
@@ -1011,10 +1455,11 @@ app.get("/join-sessions/:joinSessionId", async (req, res) => {
       requiresBond:
         typeof draft?.requiresBond === "boolean"
           ? draft.requiresBond
-          : false,
-      bondAmount: draft?.bondAmount || "0",
+          : true,
+      bondAmount: draft?.bondAmount || challengeBondForStake(draft?.stake),
       bondToken: draft?.bondToken || "MIDSTR",
-      bondMode: draft?.bondMode || "NONE",
+      bondMode: draft?.bondMode || "CHALLENGE_ONLY",
+      warning: resolutionWarningForClassification(draft?.classification),
     });
   } catch (error) {
     console.error("join session lookup failed:", error);
@@ -1150,6 +1595,7 @@ app.post("/join-sessions/:joinSessionId/confirm", async (req, res) => {
       betId: joinSession.betId,
       draftId: joinSession.draftId,
       onChainBetId: draft.onChainBetId ?? joinSession.onChainBetId ?? null,
+      warning: resolutionWarningForClassification(draft.classification),
     });
   } catch (error) {
     console.error("confirm join failed:", error);
@@ -1204,11 +1650,13 @@ app.get("/users/:telegramUserId/bets", async (req, res) => {
           creatorFundingStatus: d.creatorFundingStatus || "",
           takerFundingStatus: d.takerFundingStatus || "",
           requiresBond: Boolean(d.requiresBond),
-          bondAmount: d.bondAmount || "0",
+          bondAmount: d.bondAmount || challengeBondForStake(d.stake),
           bondToken: d.bondToken || "MIDSTR",
-          bondMode: d.bondMode || "NONE",
+          bondMode: d.bondMode || "CHALLENGE_ONLY",
           totalCreatorUpfront: d.totalCreatorUpfront || d.stake || "0",
           totalTakerUpfront: d.totalTakerUpfront || d.stake || "0",
+          resolutionSuggestion: d.resolutionSuggestion || null,
+          resolutionWarning: resolutionWarningForClassification(d.classification),
         };
       });
 
@@ -1232,7 +1680,6 @@ app.get("/users/:telegramUserId/bets/", async (req, res) => {
   );
 });
 
-// Get summary
 app.get("/users/:telegramUserId/bets/summary", async (req, res) => {
   try {
     const { telegramUserId } = req.params;
@@ -1254,8 +1701,12 @@ app.get("/users/:telegramUserId/bets/summary", async (req, res) => {
     const summary = {
       total: userDrafts.length,
       open: effectiveStatuses.filter((s) => s === "CREATED").length,
-      active: effectiveStatuses.filter((s) => s === "ACTIVE").length,
-      inPlay: 0,
+      active: effectiveStatuses.filter((s) =>
+        ["ACTIVE", "CLOSED", "WAITING_RESULT", "RESOLUTION_WINDOW", "DISPUTED"].includes(s)
+      ).length,
+      inPlay: effectiveStatuses.filter((s) =>
+        ["WAITING_RESULT", "RESOLUTION_WINDOW", "DISPUTED"].includes(s)
+      ).length,
       done: effectiveStatuses.filter((s) => s === "RESOLVED").length,
     };
 
@@ -1284,7 +1735,7 @@ app.get("/users/:telegramUserId/bets/summary/", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                    SAVE ON-CHAIN CREATOR BET (NEW)                         */
+/*                    SAVE ON-CHAIN CREATOR BET                               */
 /* -------------------------------------------------------------------------- */
 
 app.post("/drafts/:draftId/onchain-create-confirm", async (req, res) => {
@@ -1345,44 +1796,174 @@ app.post("/drafts/:draftId/onchain-create-confirm", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                    PHASE 6: PROPOSE VERIFIABLE RESULT                      */
+/*                         PHASE 6B RESOLUTION ROUTES                         */
 /* -------------------------------------------------------------------------- */
 
-const ESCROW_V3_ABI = [
-  "function proposeResultVerifiable(uint256 betId, uint8 winnerSide) external",
-  "function arbiterResolver() view returns (address)",
-  "function bets(uint256) view returns (address creatorWallet,address takerWallet,uint256 stake,uint8 resolutionType,uint8 status,uint64 closeTimeUtc,uint64 resultExpectedByUtc,uint64 proposalTimeUtc,uint64 finalisedAtUtc,uint8 proposedWinnerSide,uint8 finalWinnerSide,address challengerWallet,uint256 challengeBond,bool challengeCorrect,bool creatorFunded,bool takerFunded,bool settled)",
-];
+app.get("/resolution/status/:betId", async (req, res) => {
+  try {
+    const { betId } = req.params;
+    const telegramUserId = String(req.query?.telegramUserId || "").trim();
 
-function getResolverContract() {
-  if (!process.env.SEPOLIA_RPC_URL) {
-    throw new Error("SEPOLIA_RPC_URL missing");
+    const draftStore = await readDraftStore();
+    const draft = findDraftByBetId(draftStore, betId);
+
+    if (!draft) {
+      return res.status(404).json({
+        ok: false,
+        error: "Bet not found",
+      });
+    }
+
+    const payload = await buildResolutionStatusPayload(draft, telegramUserId);
+
+    return res.json(payload);
+  } catch (err) {
+    console.error("resolution status failed:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.shortMessage || err.message || "Failed to fetch resolution status",
+    });
   }
+});
 
-  if (!process.env.ARBITER_RESOLVER_PRIVATE_KEY) {
-    throw new Error("ARBITER_RESOLVER_PRIVATE_KEY missing");
+app.get("/resolution/actions/:betId", async (req, res) => {
+  try {
+    const { betId } = req.params;
+    const telegramUserId = String(req.query?.telegramUserId || "").trim();
+
+    const draftStore = await readDraftStore();
+    const draft = findDraftByBetId(draftStore, betId);
+
+    if (!draft) {
+      return res.status(404).json({
+        ok: false,
+        error: "Bet not found",
+      });
+    }
+
+    const payload = await buildResolutionStatusPayload(draft, telegramUserId);
+
+    return res.json({
+      ok: true,
+      betId: payload.betId,
+      status: payload.status,
+      statusLabel: payload.statusLabel,
+      role: payload.role,
+      warning: payload.warning,
+      suggestion: payload.suggestion,
+      proposedWinnerSide: payload.proposedWinnerSide,
+      proposedWinnerLabel: payload.proposedWinnerLabel,
+      challengeBondAmount: payload.challengeBondAmount,
+      bondToken: payload.bondToken,
+      actions: payload.actions,
+    });
+  } catch (err) {
+    console.error("resolution actions failed:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.shortMessage || err.message || "Failed to fetch resolution actions",
+    });
   }
+});
 
-  if (!process.env.ESCROW_TOKEN_ADDRESS) {
-    throw new Error("ESCROW_TOKEN_ADDRESS missing");
+app.post("/resolution/sync/:betId", async (req, res) => {
+  try {
+    const { betId } = req.params;
+
+    const draftStore = await readDraftStore();
+    const draft = findDraftByBetId(draftStore, betId);
+
+    if (!draft) {
+      return res.status(404).json({
+        ok: false,
+        error: "Bet not found",
+      });
+    }
+
+    const chainState = await readChainResolutionState(draft.onChainBetId);
+    await syncDraftFromChain(draft, chainState);
+    await writeDraftStore(draftStore);
+
+    return res.json({
+      ok: true,
+      betId: draft.betId,
+      status: draft.status,
+      chain: chainState,
+    });
+  } catch (err) {
+    console.error("resolution sync failed:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.shortMessage || err.message || "Failed to sync resolution status",
+    });
   }
+});
 
-  const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-  const wallet = new ethers.Wallet(
-    process.env.ARBITER_RESOLVER_PRIVATE_KEY,
-    provider
-  );
+app.post("/resolution/suggest/:betId", async (req, res) => {
+  try {
+    const { betId } = req.params;
+    const { winnerSide, evidenceSummary, confidence, sourceUrls } = req.body || {};
 
-  return new ethers.Contract(
-    process.env.ESCROW_TOKEN_ADDRESS,
-    ESCROW_V3_ABI,
-    wallet
-  );
-}
+    const parsedWinnerSide = Number(winnerSide);
+
+    if (![1, 2].includes(parsedWinnerSide)) {
+      return res.status(400).json({
+        ok: false,
+        error: "winnerSide must be 1 for creator or 2 for taker",
+      });
+    }
+
+    const draftStore = await readDraftStore();
+    const draft = findDraftByBetId(draftStore, betId);
+
+    if (!draft) {
+      return res.status(404).json({
+        ok: false,
+        error: "Bet not found",
+      });
+    }
+
+    const windowInfo = getResolutionWindowInfo(draft);
+    if (!windowInfo.windowOpen && !windowInfo.windowExpired) {
+      return res.status(400).json({
+        ok: false,
+        error: "Result Expected By has not passed yet",
+        window: windowInfo,
+      });
+    }
+
+    draft.resolutionSuggestion = {
+      winnerSide: parsedWinnerSide,
+      winnerLabel: SIDE_LABELS[parsedWinnerSide],
+      text: `Evidence points to ${SIDE_LABELS[parsedWinnerSide]} winning.`,
+      evidenceSummary: String(evidenceSummary || "").trim(),
+      confidence: confidence || "",
+      sourceUrls: Array.isArray(sourceUrls) ? sourceUrls : [],
+    };
+    draft.resolutionSuggestionAt = nowIso();
+    draft.status = "WAITING_RESULT";
+    draft.updatedAt = nowIso();
+
+    await writeDraftStore(draftStore);
+
+    return res.json({
+      ok: true,
+      betId: draft.betId,
+      suggestion: draft.resolutionSuggestion,
+      suggestionAt: draft.resolutionSuggestionAt,
+    });
+  } catch (err) {
+    console.error("resolution suggest failed:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to save resolution suggestion",
+    });
+  }
+});
 
 app.post("/resolution/propose-verifiable", async (req, res) => {
   try {
-    const { onChainBetId, winnerSide } = req.body || {};
+    const { betId, onChainBetId, winnerSide, evidenceSummary, confidence, sourceUrls } = req.body || {};
 
     if (onChainBetId === undefined || onChainBetId === null) {
       return res.status(400).json({
@@ -1400,19 +1981,25 @@ app.post("/resolution/propose-verifiable", async (req, res) => {
       });
     }
 
-    const contract = getResolverContract();
+    const draftStore = await readDraftStore();
+    const draft = betId ? findDraftByBetId(draftStore, betId) : draftStore.drafts.find(
+      (d) => Number(d.onChainBetId) === Number(onChainBetId)
+    );
 
-    const resolverAddress = await contract.arbiterResolver();
-    const signerAddress = await contract.runner.getAddress();
+    if (draft) {
+      const windowInfo = getResolutionWindowInfo(draft);
 
-    if (resolverAddress.toLowerCase() !== signerAddress.toLowerCase()) {
-      return res.status(403).json({
-        ok: false,
-        error: "Backend signer is not the contract arbiterResolver",
-        resolverAddress,
-        signerAddress,
-      });
+      if (!windowInfo.windowOpen && !windowInfo.windowExpired) {
+        return res.status(400).json({
+          ok: false,
+          error: "Result Expected By has not passed yet",
+          window: windowInfo,
+        });
+      }
     }
+
+    const contract = getResolverContract();
+    const signerInfo = await assertResolverSigner(contract);
 
     const betBefore = await contract.bets(BigInt(onChainBetId));
 
@@ -1424,28 +2011,204 @@ app.post("/resolution/propose-verifiable", async (req, res) => {
     const receipt = await tx.wait();
 
     const betAfter = await contract.bets(BigInt(onChainBetId));
+    const chainAfter = parseChainBet(betAfter);
+
+    if (draft) {
+      draft.resolutionSuggestion = {
+        winnerSide: parsedWinnerSide,
+        winnerLabel: SIDE_LABELS[parsedWinnerSide],
+        text: `Evidence points to ${SIDE_LABELS[parsedWinnerSide]} winning.`,
+        evidenceSummary: String(evidenceSummary || "").trim(),
+        confidence: confidence || "",
+        sourceUrls: Array.isArray(sourceUrls) ? sourceUrls : [],
+      };
+      draft.resolutionSuggestionAt = nowIso();
+      draft.resolutionProposedTxHash = tx.hash;
+      draft.status = "RESOLUTION_WINDOW";
+      draft.updatedAt = nowIso();
+      await writeDraftStore(draftStore);
+    }
 
     return res.json({
       ok: true,
+      betId: draft?.betId || "",
       onChainBetId: Number(onChainBetId),
       winnerSide: parsedWinnerSide,
+      winnerLabel: SIDE_LABELS[parsedWinnerSide],
       txHash: tx.hash,
       blockNumber: receipt.blockNumber,
+      resolverAddress: signerInfo.resolverAddress,
+      signerAddress: signerInfo.signerAddress,
       before: {
         status: Number(betBefore.status),
         proposedWinnerSide: Number(betBefore.proposedWinnerSide),
       },
       after: {
-        status: Number(betAfter.status),
-        proposedWinnerSide: Number(betAfter.proposedWinnerSide),
-        proposalTimeUtc: Number(betAfter.proposalTimeUtc),
+        status: chainAfter.status,
+        statusName: chainAfter.statusName,
+        proposedWinnerSide: chainAfter.proposedWinnerSide,
+        proposalTimeUtc: chainAfter.proposalTimeUtc,
+        proposalTimeIso: chainAfter.proposalTimeIso,
       },
     });
   } catch (err) {
     console.error("propose-verifiable failed:", err);
-    return res.status(500).json({
+    return res.status(err.statusCode || 500).json({
       ok: false,
       error: err.shortMessage || err.message || "Failed to propose result",
+      details: err.details || undefined,
+    });
+  }
+});
+
+app.post("/resolution/finalise-dispute", async (req, res) => {
+  try {
+    const { betId, onChainBetId, finalWinnerSide, challengeCorrect } = req.body || {};
+
+    if (onChainBetId === undefined || onChainBetId === null) {
+      return res.status(400).json({
+        ok: false,
+        error: "onChainBetId is required",
+      });
+    }
+
+    const parsedWinnerSide = Number(finalWinnerSide);
+
+    if (![1, 2].includes(parsedWinnerSide)) {
+      return res.status(400).json({
+        ok: false,
+        error: "finalWinnerSide must be 1 for creator or 2 for taker",
+      });
+    }
+
+    if (typeof challengeCorrect !== "boolean") {
+      return res.status(400).json({
+        ok: false,
+        error: "challengeCorrect must be true or false",
+      });
+    }
+
+    const contract = getResolverContract();
+    const signerInfo = await assertResolverSigner(contract);
+
+    const betBefore = await contract.bets(BigInt(onChainBetId));
+
+    const tx = await contract.finaliseDispute(
+      BigInt(onChainBetId),
+      parsedWinnerSide,
+      challengeCorrect
+    );
+
+    const receipt = await tx.wait();
+
+    const betAfter = await contract.bets(BigInt(onChainBetId));
+    const chainAfter = parseChainBet(betAfter);
+
+    const draftStore = await readDraftStore();
+    const draft = betId ? findDraftByBetId(draftStore, betId) : draftStore.drafts.find(
+      (d) => Number(d.onChainBetId) === Number(onChainBetId)
+    );
+
+    if (draft) {
+      draft.status = "FINALISED";
+      draft.disputeFinaliseTxHash = tx.hash;
+      draft.finalWinnerSide = parsedWinnerSide;
+      draft.challengeCorrect = challengeCorrect;
+      draft.updatedAt = nowIso();
+      await writeDraftStore(draftStore);
+    }
+
+    return res.json({
+      ok: true,
+      betId: draft?.betId || "",
+      onChainBetId: Number(onChainBetId),
+      finalWinnerSide: parsedWinnerSide,
+      finalWinnerLabel: SIDE_LABELS[parsedWinnerSide],
+      challengeCorrect,
+      txHash: tx.hash,
+      blockNumber: receipt.blockNumber,
+      resolverAddress: signerInfo.resolverAddress,
+      signerAddress: signerInfo.signerAddress,
+      before: {
+        status: Number(betBefore.status),
+        proposedWinnerSide: Number(betBefore.proposedWinnerSide),
+        finalWinnerSide: Number(betBefore.finalWinnerSide),
+      },
+      after: {
+        status: chainAfter.status,
+        statusName: chainAfter.statusName,
+        proposedWinnerSide: chainAfter.proposedWinnerSide,
+        finalWinnerSide: chainAfter.finalWinnerSide,
+        finalisedAtUtc: chainAfter.finalisedAtUtc,
+        finalisedAtIso: chainAfter.finalisedAtIso,
+      },
+    });
+  } catch (err) {
+    console.error("finalise-dispute failed:", err);
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.shortMessage || err.message || "Failed to finalise dispute",
+      details: err.details || undefined,
+    });
+  }
+});
+
+app.post("/resolution/action-confirm", async (req, res) => {
+  try {
+    const { betId, action, txHash } = req.body || {};
+
+    if (!betId || !action || !txHash) {
+      return res.status(400).json({
+        ok: false,
+        error: "betId, action, and txHash are required",
+      });
+    }
+
+    const draftStore = await readDraftStore();
+    const draft = findDraftByBetId(draftStore, betId);
+
+    if (!draft) {
+      return res.status(404).json({
+        ok: false,
+        error: "Bet not found",
+      });
+    }
+
+    const normalizedAction = String(action || "").toUpperCase();
+
+    draft.lastResolutionAction = normalizedAction;
+    draft.lastResolutionTxHash = txHash;
+    draft.resolutionUpdatedAt = nowIso();
+    draft.updatedAt = nowIso();
+
+    if (normalizedAction === "CHALLENGE") {
+      draft.status = "DISPUTED";
+    }
+
+    if (["CONCEDE", "SETTLE", "TIMEOUT"].includes(normalizedAction)) {
+      draft.status = "RESOLVED";
+    }
+
+    const chainState = await readChainResolutionState(draft.onChainBetId).catch(() => null);
+    if (chainState) {
+      await syncDraftFromChain(draft, chainState);
+    }
+
+    await writeDraftStore(draftStore);
+
+    return res.json({
+      ok: true,
+      betId: draft.betId,
+      action: normalizedAction,
+      txHash,
+      status: draft.status,
+      chain: chainState,
+    });
+  } catch (err) {
+    console.error("resolution action confirm failed:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to confirm resolution action",
     });
   }
 });
