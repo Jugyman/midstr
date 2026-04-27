@@ -207,26 +207,36 @@ function ensureDraftDefaults(draft) {
   const classification = normaliseClassification(draft.classification);
   const stake = normalizeStake(draft.stake) || "0";
 
-  const defaultChallengeBond = challengeBondForStake(stake);
+  const manualBond = challengeBondForStake(stake); // V5 manual bond = 50% stake
+  const challengeBond = challengeBondForStake(stake); // V5 challenge bond = 50% stake
+
+  const isManualOnly = classification === "MANUAL_ONLY";
+  const usesChallengeBond =
+    classification === "VERIFIABLE" || classification === "AMBIGUOUS";
+
   const existingBondAmount = normalizeTokenAmount(draft.bondAmount, "0");
 
-  const shouldHaveChallengeBond =
-    classification === "VERIFIABLE" ||
-    classification === "AMBIGUOUS" ||
-    classification === "MANUAL_ONLY";
-
   const fixedBondAmount =
-    shouldHaveChallengeBond && Number(existingBondAmount) <= 0
-      ? defaultChallengeBond
-      : existingBondAmount;
+    isManualOnly || usesChallengeBond
+      ? Number(existingBondAmount) > 0
+        ? existingBondAmount
+        : challengeBond
+      : "0";
+
+  const bondMode = isManualOnly ? "UPFRONT_MANUAL" : "CHALLENGE_ONLY";
+
+  const defaultUpfront = isManualOnly
+    ? String(Number(stake) + Number(manualBond))
+    : stake;
 
   const totalCreatorUpfront = normalizeTokenAmount(
     draft.totalCreatorUpfront,
-    stake
+    defaultUpfront
   );
+
   const totalTakerUpfront = normalizeTokenAmount(
     draft.totalTakerUpfront,
-    stake
+    defaultUpfront
   );
 
   return {
@@ -245,10 +255,14 @@ function ensureDraftDefaults(draft) {
       draft.onChainBetId === null || draft.onChainBetId === undefined
         ? null
         : Number(draft.onChainBetId),
-    requiresBond: shouldHaveChallengeBond,
+
+    requiresBond: isManualOnly || usesChallengeBond,
     bondAmount: fixedBondAmount,
+    manualBondAmount: isManualOnly ? manualBond : "0",
+    challengeBondAmount: usesChallengeBond ? challengeBond : "0",
     bondToken: draft.bondToken || "MIDSTR",
-    bondMode: draft.bondMode || "CHALLENGE_ONLY",
+    bondMode,
+
     totalCreatorUpfront,
     totalTakerUpfront,
     resultExpectedBy: draft.resultExpectedBy || null,
@@ -502,6 +516,7 @@ function parseChainBet(raw) {
     resolutionType: Number(raw.resolutionType),
     status: Number(raw.status),
     statusName: CHAIN_STATUS[Number(raw.status)] || "UNKNOWN",
+
     closeTimeUtc: Number(raw.closeTimeUtc),
     closeTimeIso: isoFromUnixSeconds(raw.closeTimeUtc),
     resultExpectedByUtc: Number(raw.resultExpectedByUtc),
@@ -510,16 +525,23 @@ function parseChainBet(raw) {
     proposalTimeIso: isoFromUnixSeconds(raw.proposalTimeUtc),
     finalisedAtUtc: Number(raw.finalisedAtUtc),
     finalisedAtIso: isoFromUnixSeconds(raw.finalisedAtUtc),
+
     proposedWinnerSide: Number(raw.proposedWinnerSide),
     proposedWinnerLabel: SIDE_LABELS[Number(raw.proposedWinnerSide)] || "Unknown",
     finalWinnerSide: Number(raw.finalWinnerSide),
     finalWinnerLabel: SIDE_LABELS[Number(raw.finalWinnerSide)] || "Unknown",
+
     challengerWallet: raw.challengerWallet,
     challengeBond: raw.challengeBond?.toString?.() || "0",
     challengeCorrect: Boolean(raw.challengeCorrect),
+
+    creatorManualBond: raw.creatorManualBond?.toString?.() || "0",
+    takerManualBond: raw.takerManualBond?.toString?.() || "0",
+
     creatorFunded: Boolean(raw.creatorFunded),
     takerFunded: Boolean(raw.takerFunded),
     settled: Boolean(raw.settled),
+    manualNoClearWinner: Boolean(raw.manualNoClearWinner),
   };
 }
 
@@ -634,16 +656,91 @@ async function classifyBetWithAI(betText) {
   return parsed;
 }
 
+async function suggestAmbiguousWinnerWithAI(draft) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is missing in midstr-backend");
+  }
+
+  const response = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.1,
+    messages: [
+      {
+        role: "system",
+        content: [
+          "You are The Arbiter, the MIDSTR V5 resolution assistant.",
+          "Return JSON only.",
+          "",
+          "Your job is to review an AMBIGUOUS wager and suggest which side the available evidence points to.",
+          "",
+          "Creator side = the original claim is true.",
+          "Taker side = the original claim is not true.",
+          "",
+          "You are NOT finalising the bet on-chain.",
+          "You are only producing an off-chain suggestion.",
+          "",
+          "If evidence points to the creator claim being true, winnerSide = 1.",
+          "If evidence points against the creator claim, winnerSide = 2.",
+          "",
+          "Do not use winnerSide 0 here.",
+          "Keep reasoning short and practical.",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          `Wager: ${draft.cleanedBetText || draft.originalBetText || ""}`,
+          `Classification: ${draft.classification || ""}`,
+          `Settlement basis: ${draft.settlementBasis || ""}`,
+          `Result expected by: ${draft.resultExpectedBy || ""}`,
+          "",
+          "Suggest which side currently appears to have won.",
+        ].join("\n"),
+      },
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "midstr_ambiguous_resolution_suggestion",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            winnerSide: {
+              type: "number",
+              enum: [1, 2],
+            },
+            evidenceSummary: { type: "string" },
+            confidence: {
+              type: "string",
+              enum: ["LOW", "MEDIUM", "HIGH"],
+            },
+          },
+          required: ["winnerSide", "evidenceSummary", "confidence"],
+        },
+      },
+    },
+  });
+
+  return JSON.parse(response.choices[0].message.content);
+}
+
 /* -------------------------------------------------------------------------- */
 /*                              CONTRACT HELPERS                              */
 /* -------------------------------------------------------------------------- */
 
-const ESCROW_V3_ABI = [
+const ESCROW_V5_ABI = [
   "function proposeResultVerifiable(uint256 betId, uint8 winnerSide) external",
   "function finaliseDispute(uint256 betId, uint8 finalWinnerSide, bool challengeCorrect) external",
+  "function finaliseManualDispute(uint256 betId, uint8 finalWinnerSide) external",
   "function refreshStatus(uint256 betId) external",
+
   "function arbiterResolver() view returns (address)",
   "function challengeBondAmount(uint256 betId) view returns (uint256)",
+  "function manualBondAmount(uint256 betId) view returns (uint256)",
+  "function creatorUpfrontAmount(uint256 betId) view returns (uint256)",
+  "function takerUpfrontAmount(uint256 betId) view returns (uint256)",
   "function callerRewardAmount(uint256 betId) view returns (uint256)",
   "function potAmount(uint256 betId) view returns (uint256)",
   "function canClaimWin(uint256 betId, address user) view returns (bool)",
@@ -652,7 +749,8 @@ const ESCROW_V3_ABI = [
   "function canSettle(uint256 betId) view returns (bool)",
   "function canTimeoutResolve(uint256 betId) view returns (bool)",
   "function getWindowStart(uint256 betId) view returns (uint256)",
-  "function bets(uint256) view returns (address creatorWallet,address takerWallet,uint256 stake,uint8 resolutionType,uint8 status,uint64 closeTimeUtc,uint64 resultExpectedByUtc,uint64 proposalTimeUtc,uint64 finalisedAtUtc,uint8 proposedWinnerSide,uint8 finalWinnerSide,address challengerWallet,uint256 challengeBond,bool challengeCorrect,bool creatorFunded,bool takerFunded,bool settled)",
+
+  "function bets(uint256) view returns (address creatorWallet,address takerWallet,uint256 stake,uint8 resolutionType,uint8 status,uint64 closeTimeUtc,uint64 resultExpectedByUtc,uint64 proposalTimeUtc,uint64 finalisedAtUtc,uint8 proposedWinnerSide,uint8 finalWinnerSide,address challengerWallet,uint256 challengeBond,bool challengeCorrect,uint256 creatorManualBond,uint256 takerManualBond,bool creatorFunded,bool takerFunded,bool settled,bool manualNoClearWinner)",
 ];
 
 function getProvider() {
@@ -670,7 +768,7 @@ function getReadContract() {
 
   return new ethers.Contract(
     process.env.ESCROW_TOKEN_ADDRESS,
-    ESCROW_V3_ABI,
+    ESCROW_V5_ABI,
     getProvider()
   );
 }
@@ -691,7 +789,7 @@ function getResolverContract() {
 
   return new ethers.Contract(
     process.env.ESCROW_TOKEN_ADDRESS,
-    ESCROW_V3_ABI,
+    ESCROW_V5_ABI,
     wallet
   );
 }
@@ -793,11 +891,28 @@ async function syncDraftFromChain(draft, chainState) {
   }
 
   draft.chainStatus = chainStatus;
+
   draft.chainProposedWinnerSide = chainState.proposedWinnerSide;
   draft.chainFinalWinnerSide = chainState.finalWinnerSide;
+
   draft.chainChallengeBond = chainState.challengeBond;
   draft.chainChallengeCorrect = chainState.challengeCorrect;
+
+  // V5 manual fields
+  draft.creatorManualBond = chainState.creatorManualBond || "0";
+  draft.takerManualBond = chainState.takerManualBond || "0";
+  draft.manualNoClearWinner = Boolean(chainState.manualNoClearWinner);
+
   draft.chainSettled = chainState.settled;
+
+  if (chainState.finalWinnerSide === 0 && chainState.manualNoClearWinner) {
+    draft.finalResolutionLabel = "NO_CLEAR_WINNER";
+  } else if (chainState.finalWinnerSide === 1) {
+    draft.finalResolutionLabel = "CREATOR_WINS";
+  } else if (chainState.finalWinnerSide === 2) {
+    draft.finalResolutionLabel = "TAKER_WINS";
+  }
+
   draft.resolutionUpdatedAt = now;
   draft.updatedAt = now;
 
@@ -884,6 +999,23 @@ async function buildResolutionStatusPayload(draft, telegramUserId = "") {
     challengeBondAmount:
       chainState?.challengeBondAmount ||
       ethers.parseUnits(challengeBondForStake(draft.stake), 18).toString(),
+
+    manualBondAmount:
+      chainState?.manualBondAmount ||
+      ethers.parseUnits(draft.manualBondAmount || "0", 18).toString(),
+
+    creatorManualBond:
+      chainState?.creatorManualBond ||
+      ethers.parseUnits(draft.creatorManualBond || "0", 18).toString(),
+
+    takerManualBond:
+      chainState?.takerManualBond ||
+      ethers.parseUnits(draft.takerManualBond || "0", 18).toString(),
+
+    manualNoClearWinner:
+      Boolean(chainState?.manualNoClearWinner || draft.manualNoClearWinner),
+
+    bondMode: draft.bondMode || "CHALLENGE_ONLY",
     bondToken: "MIDSTR",
     chain: chainState,
     actions,
@@ -1899,6 +2031,78 @@ app.post("/resolution/sync/:betId", async (req, res) => {
   }
 });
 
+app.post("/resolution/ai-suggest/:betId", async (req, res) => {
+  try {
+    const { betId } = req.params;
+
+    const draftStore = await readDraftStore();
+    const draft = findDraftByBetId(draftStore, betId);
+
+    if (!draft) {
+      return res.status(404).json({
+        ok: false,
+        error: "Bet not found",
+      });
+    }
+
+    if (draft.classification !== "AMBIGUOUS") {
+      return res.status(400).json({
+        ok: false,
+        error: "AI suggestion route is currently for AMBIGUOUS bets only",
+      });
+    }
+
+    const windowInfo = getResolutionWindowInfo(draft);
+    if (!windowInfo.windowOpen && !windowInfo.windowExpired) {
+      return res.status(400).json({
+        ok: false,
+        error: "Result Expected By has not passed yet",
+        window: windowInfo,
+      });
+    }
+
+    const ai = await suggestAmbiguousWinnerWithAI(draft);
+    const parsedWinnerSide = Number(ai.winnerSide);
+
+    if (![1, 2].includes(parsedWinnerSide)) {
+      return res.status(500).json({
+        ok: false,
+        error: "AI returned invalid winnerSide",
+        ai,
+      });
+    }
+
+    draft.resolutionSuggestion = {
+      winnerSide: parsedWinnerSide,
+      winnerLabel: SIDE_LABELS[parsedWinnerSide],
+      text: `Evidence points to ${SIDE_LABELS[parsedWinnerSide]} winning.`,
+      evidenceSummary: String(ai.evidenceSummary || "").trim(),
+      confidence: ai.confidence || "LOW",
+      sourceUrls: [],
+    };
+
+    draft.resolutionSuggestionAt = nowIso();
+    draft.status = "WAITING_RESULT";
+    draft.updatedAt = nowIso();
+
+    await writeDraftStore(draftStore);
+
+    return res.json({
+      ok: true,
+      betId: draft.betId,
+      suggestion: draft.resolutionSuggestion,
+      suggestionAt: draft.resolutionSuggestionAt,
+      note: "This is an off-chain Arbiter suggestion. Suggested winner must still Claim Win to open the on-chain response path.",
+    });
+  } catch (err) {
+    console.error("resolution ai-suggest failed:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to generate AI resolution suggestion",
+    });
+  }
+});
+
 app.post("/resolution/suggest/:betId", async (req, res) => {
   try {
     const { betId } = req.params;
@@ -2148,6 +2352,114 @@ app.post("/resolution/finalise-dispute", async (req, res) => {
     return res.status(err.statusCode || 500).json({
       ok: false,
       error: err.shortMessage || err.message || "Failed to finalise dispute",
+      details: err.details || undefined,
+    });
+  }
+});
+
+app.post("/resolution/finalise-manual-dispute", async (req, res) => {
+  try {
+    const { betId, onChainBetId, finalWinnerSide } = req.body || {};
+
+    if (onChainBetId === undefined || onChainBetId === null) {
+      return res.status(400).json({
+        ok: false,
+        error: "onChainBetId is required",
+      });
+    }
+
+    const parsedWinnerSide = Number(finalWinnerSide);
+
+    if (![0, 1, 2].includes(parsedWinnerSide)) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "finalWinnerSide must be 0 for no clear winner, 1 for creator, or 2 for taker",
+      });
+    }
+
+    const contract = getResolverContract();
+    const signerInfo = await assertResolverSigner(contract);
+
+    const betBefore = await contract.bets(BigInt(onChainBetId));
+
+    if (Number(betBefore.resolutionType) !== RESOLUTION_TYPES.MANUAL_ONLY) {
+      return res.status(400).json({
+        ok: false,
+        error: "This route is only for MANUAL_ONLY disputes",
+      });
+    }
+
+    const tx = await contract.finaliseManualDispute(
+      BigInt(onChainBetId),
+      parsedWinnerSide
+    );
+
+    const receipt = await tx.wait();
+
+    const betAfter = await contract.bets(BigInt(onChainBetId));
+    const chainAfter = parseChainBet(betAfter);
+
+    const draftStore = await readDraftStore();
+    const draft = betId
+      ? findDraftByBetId(draftStore, betId)
+      : draftStore.drafts.find(
+          (d) => Number(d.onChainBetId) === Number(onChainBetId)
+        );
+
+    if (draft) {
+      draft.status = "FINALISED";
+      draft.disputeFinaliseTxHash = tx.hash;
+      draft.finalWinnerSide = parsedWinnerSide;
+      draft.manualNoClearWinner = parsedWinnerSide === 0;
+      draft.updatedAt = nowIso();
+      await writeDraftStore(draftStore);
+    }
+
+    return res.json({
+      ok: true,
+      betId: draft?.betId || "",
+      onChainBetId: Number(onChainBetId),
+      finalWinnerSide: parsedWinnerSide,
+      finalWinnerLabel:
+        parsedWinnerSide === 0
+          ? "No clear winner"
+          : SIDE_LABELS[parsedWinnerSide],
+      manualNoClearWinner: parsedWinnerSide === 0,
+      txHash: tx.hash,
+      blockNumber: receipt.blockNumber,
+      resolverAddress: signerInfo.resolverAddress,
+      signerAddress: signerInfo.signerAddress,
+      before: {
+        status: Number(betBefore.status),
+        resolutionType: Number(betBefore.resolutionType),
+        proposedWinnerSide: Number(betBefore.proposedWinnerSide),
+        finalWinnerSide: Number(betBefore.finalWinnerSide),
+        manualNoClearWinner: Boolean(betBefore.manualNoClearWinner),
+      },
+      after: {
+        status: chainAfter.status,
+        statusName: chainAfter.statusName,
+        resolutionType: chainAfter.resolutionType,
+        proposedWinnerSide: chainAfter.proposedWinnerSide,
+        finalWinnerSide: chainAfter.finalWinnerSide,
+        finalWinnerLabel:
+          chainAfter.finalWinnerSide === 0
+            ? "No clear winner"
+            : chainAfter.finalWinnerLabel,
+        manualNoClearWinner: chainAfter.manualNoClearWinner,
+        finalisedAtUtc: chainAfter.finalisedAtUtc,
+        finalisedAtIso: chainAfter.finalisedAtIso,
+      },
+    });
+  } catch (err) {
+    console.error("finalise-manual-dispute failed:", err);
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error:
+        err.shortMessage ||
+        err.message ||
+        "Failed to finalise manual dispute",
       details: err.details || undefined,
     });
   }
