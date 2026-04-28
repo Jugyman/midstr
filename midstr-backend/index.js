@@ -923,7 +923,9 @@ async function buildResolutionStatusPayload(draft, telegramUserId = "") {
   const joinStore = await readJoinStore();
   const effectiveStatus = deriveEffectiveBetStatus(draft, joinStore);
   const role = getUserRoleForDraft(draft, telegramUserId);
-  const userWallet = role === "CREATOR" ? draft.creatorWallet : role === "TAKER" ? draft.takerWallet : "";
+  const userWallet =
+    role === "CREATOR" ? draft.creatorWallet : role === "TAKER" ? draft.takerWallet : "";
+
   const chainState = await readChainResolutionState(draft.onChainBetId, userWallet).catch((err) => {
     console.warn("[resolution-status] chain read failed:", err.message);
     return null;
@@ -931,25 +933,34 @@ async function buildResolutionStatusPayload(draft, telegramUserId = "") {
 
   const windowInfo = getResolutionWindowInfo(draft);
   const userSide = sideForRole(role);
-  const proposedWinnerSide =
-    chainState?.proposedWinnerSide ||
-    Number(draft.resolutionSuggestion?.winnerSide || 0);
 
-  const proposedLoserSide = proposedWinnerSide ? oppositeSide(proposedWinnerSide) : 0;
+  const chainProposedWinnerSide = Number(chainState?.proposedWinnerSide || 0);
+  const suggestedWinnerSide = Number(draft.resolutionSuggestion?.winnerSide || 0);
+
+  // Display can show off-chain AI suggestion, but actions must distinguish it from on-chain proposal.
+  const proposedWinnerSide = chainProposedWinnerSide || suggestedWinnerSide;
+
+  const proposedLoserSide = chainProposedWinnerSide
+    ? oppositeSide(chainProposedWinnerSide)
+    : 0;
+
+  const userIsSuggestedWinner =
+    suggestedWinnerSide > 0 && userSide === suggestedWinnerSide;
 
   const actions = {
     claimWin: {
       visible:
         role !== "UNKNOWN" &&
         draft.classification !== "VERIFIABLE" &&
-        !proposedWinnerSide &&
+        !chainProposedWinnerSide &&
+        userIsSuggestedWinner &&
         (chainState?.userActions?.canClaimWin || windowInfo.windowOpen),
       url: actionUrl(draft.betId, "claim"),
     },
     concede: {
       visible:
         role !== "UNKNOWN" &&
-        proposedWinnerSide > 0 &&
+        chainProposedWinnerSide > 0 &&
         userSide === proposedLoserSide &&
         (chainState?.userActions?.canConcede || windowInfo.windowOpen),
       url: actionUrl(draft.betId, "concede"),
@@ -957,7 +968,7 @@ async function buildResolutionStatusPayload(draft, telegramUserId = "") {
     challenge: {
       visible:
         role !== "UNKNOWN" &&
-        proposedWinnerSide > 0 &&
+        chainProposedWinnerSide > 0 &&
         userSide === proposedLoserSide &&
         (chainState?.userActions?.canChallenge || windowInfo.windowOpen),
       url: actionUrl(draft.betId, "challenge"),
@@ -967,7 +978,10 @@ async function buildResolutionStatusPayload(draft, telegramUserId = "") {
       url: actionUrl(draft.betId, "settle"),
     },
     timeoutResolve: {
-      visible: Boolean(chainState?.canTimeoutResolve || (windowInfo.windowExpired && !proposedWinnerSide)),
+      visible: Boolean(
+        chainState?.canTimeoutResolve ||
+          (windowInfo.windowExpired && !chainProposedWinnerSide && !suggestedWinnerSide)
+      ),
       url: actionUrl(draft.betId, "timeout"),
     },
     checkStatus: {
@@ -1015,6 +1029,8 @@ async function buildResolutionStatusPayload(draft, telegramUserId = "") {
     manualNoClearWinner:
       Boolean(chainState?.manualNoClearWinner || draft.manualNoClearWinner),
 
+    chainProposedWinnerSide,
+    suggestedWinnerSide,
     bondMode: draft.bondMode || "CHALLENGE_ONLY",
     bondToken: "MIDSTR",
     chain: chainState,
